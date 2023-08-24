@@ -1,8 +1,8 @@
-import argparse
 import inspect
 import logging
 import math
 import os
+import sys
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -12,13 +12,16 @@ import accelerate
 import datasets
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Subset
+
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from datasets import load_dataset
-from huggingface_hub import HfFolder, Repository, create_repo, whoami
+from huggingface_hub import Repository, create_repo
 from packaging import version
 from torchvision import transforms
+import torchvision.utils as tvu
 from tqdm.auto import tqdm
 
 import diffusers
@@ -26,13 +29,22 @@ from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import (
-    check_min_version,
     is_accelerate_version,
     is_tensorboard_available,
     is_wandb_available,
 )
 from diffusers.utils.import_utils import is_xformers_available
+from tpdmpipeline import TPDMPipeline
+from utils import parse_args, _extract_into_tensor, get_full_repo_name
+from dataset import ImageFolderDataset
 
+cur_dir = Path(__file__).parent
+stylegan_dir = cur_dir / "stylegan"
+sys.path.append(stylegan_dir.as_posix())
+
+# StyleGAN imports
+import dnnlib
+import legacy
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.20.0.dev0")
@@ -40,337 +52,12 @@ from diffusers.utils.import_utils import is_xformers_available
 logger = get_logger(__name__, log_level="INFO")
 
 
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """
-    Extract values from a 1-D numpy array for a batch of indices.
-
-    :param arr: the 1-D numpy array.
-    :param timesteps: a tensor of indices into the array to extract.
-    :param broadcast_shape: a larger shape of K dimensions with the batch
-                            dimension equal to the length of timesteps.
-    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
-    """
-    if not isinstance(arr, torch.Tensor):
-        arr = torch.from_numpy(arr)
-    res = arr[timesteps].float().to(timesteps.device)
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    return res.expand(broadcast_shape)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that HF Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--model_config_name_or_path",
-        type=str,
-        default=None,
-        help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="ddpm-model-64",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument("--overwrite_output_dir", action="store_true")
-    parser.add_argument(
-        "--cache_dir",
-        type=str,
-        default=None,
-        help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=64,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        default=False,
-        action="store_true",
-        help="whether to randomly flip images horizontally",
-    )
-    parser.add_argument(
-        "--train_batch_size",
-        type=int,
-        default=16,
-        help="Batch size (per device) for the training dataloader.",
-    )
-    parser.add_argument(
-        "--eval_batch_size",
-        type=int,
-        default=16,
-        help="The number of images to generate for evaluation.",
-    )
-    parser.add_argument(
-        "--dataloader_num_workers",
-        type=int,
-        default=0,
-        help=(
-            "The number of subprocesses to use for data loading. 0 means that the data will be loaded in the main"
-            " process."
-        ),
-    )
-    parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument(
-        "--save_images_epochs",
-        type=int,
-        default=10,
-        help="How often to save images during training.",
-    )
-    parser.add_argument(
-        "--save_model_epochs",
-        type=int,
-        default=10,
-        help="How often to save the model during training.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        choices=[1, 2, 3, 4],
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="cosine",
-        choices=[
-            "linear",
-            "cosine",
-            "cosine_with_restarts",
-            "polynomial",
-            "constant",
-            "constant_with_warmup",
-        ],
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
-    )
-    parser.add_argument(
-        "--lr_warmup_steps",
-        type=int,
-        default=500,
-        help="Number of steps for the warmup in the lr scheduler.",
-    )
-    parser.add_argument(
-        "--adam_beta1",
-        type=float,
-        default=0.95,
-        help="The beta1 parameter for the Adam optimizer.",
-    )
-    parser.add_argument(
-        "--adam_beta2",
-        type=float,
-        default=0.999,
-        help="The beta2 parameter for the Adam optimizer.",
-    )
-    parser.add_argument(
-        "--adam_weight_decay",
-        type=float,
-        default=1e-6,
-        help="Weight decay magnitude for the Adam optimizer.",
-    )
-    parser.add_argument(
-        "--adam_epsilon",
-        type=float,
-        default=1e-08,
-        help="Epsilon value for the Adam optimizer.",
-    )
-    parser.add_argument(
-        "--use_ema",
-        action="store_true",
-        help="Whether to use Exponential Moving Average for the final model weights.",
-    )
-    parser.add_argument(
-        "--ema_inv_gamma",
-        type=float,
-        default=1.0,
-        help="The inverse gamma value for the EMA decay.",
-    )
-    parser.add_argument(
-        "--ema_power",
-        type=float,
-        default=3 / 4,
-        help="The power value for the EMA decay.",
-    )
-    parser.add_argument(
-        "--ema_max_decay",
-        type=float,
-        default=0.9999,
-        help="The maximum decay magnitude for EMA.",
-    )
-    parser.add_argument(
-        "--push_to_hub",
-        action="store_true",
-        help="Whether or not to push the model to the Hub.",
-    )
-    parser.add_argument(
-        "--hub_token",
-        type=str,
-        default=None,
-        help="The token to use to push to the Model Hub.",
-    )
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--hub_private_repo",
-        action="store_true",
-        help="Whether or not to create a private repository.",
-    )
-    parser.add_argument(
-        "--logger",
-        type=str,
-        default="tensorboard",
-        choices=["tensorboard", "wandb"],
-        help=(
-            "Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) or [wandb](https://www.wandb.ai)"
-            " for experiment tracking and logging of model metrics and model checkpoints"
-        ),
-    )
-    parser.add_argument(
-        "--logging_dir",
-        type=str,
-        default="logs",
-        help=(
-            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
-            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
-        ),
-    )
-    parser.add_argument(
-        "--local_rank",
-        type=int,
-        default=-1,
-        help="For distributed training: local_rank",
-    )
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="no",
-        choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose"
-            "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
-            "and an Nvidia Ampere GPU."
-        ),
-    )
-    parser.add_argument(
-        "--prediction_type",
-        type=str,
-        default="epsilon",
-        choices=["epsilon", "sample"],
-        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
-    )
-    parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=500,
-        help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
-            " training using `--resume_from_checkpoint`."
-        ),
-    )
-    parser.add_argument(
-        "--checkpoints_total_limit",
-        type=int,
-        default=None,
-        help=("Max number of checkpoints to store."),
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        ),
-    )
-    parser.add_argument(
-        "--enable_xformers_memory_efficient_attention",
-        action="store_true",
-        help="Whether or not to use xformers.",
-    )
-
-    args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError(
-            "You must specify either a dataset name from the hub or a train data directory."
-        )
-
-    return args
-
-
-def get_full_repo_name(
-    model_id: str, organization: Optional[str] = None, token: Optional[str] = None
-):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
-    else:
-        return f"{organization}/{model_id}"
-
-
 def main(args):
+    torch.backends.cuda.matmul.allow_tf32 = True
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    image_dir = Path(args.output_dir) /  "images"
+    image_dir.mkdir(exist_ok=True, parents=True)
+
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
     )
@@ -398,6 +85,8 @@ def main(args):
                 "Make sure to install wandb if you want to use it for logging during training."
             )
         import wandb
+
+    gan_ckpt_path = Path("./pretrained/gan_celeb64_trunc499/gan.pkl")
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -471,6 +160,7 @@ def main(args):
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
+    print("Preparing model...")
     # Initialize the model
     if args.model_config_name_or_path is None:
         model = UNet2DModel(
@@ -502,6 +192,8 @@ def main(args):
     else:
         config = UNet2DModel.load_config(args.model_config_name_or_path)
         model = UNet2DModel.from_config(config)
+    model = torch.compile(model)
+    gan = None
 
     # Create EMA for the model.
     if args.use_ema:
@@ -560,32 +252,17 @@ def main(args):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
-    else:
-        dataset = load_dataset(
-            "imagefolder",
-            data_dir=args.train_data_dir,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
+    print("Preparing dataset...")
     # Preprocessing the datasets and DataLoaders creation.
     augmentations = transforms.Compose(
         [
             transforms.Resize(
                 args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
             ),
-            transforms.CenterCrop(args.resolution)
-            if args.center_crop
-            else transforms.RandomCrop(args.resolution),
+            # transforms.CenterCrop(args.resolution)
+            # if args.center_crop
+            # else transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip()
             if args.random_flip
             else transforms.Lambda(lambda x: x),
@@ -594,13 +271,36 @@ def main(args):
         ]
     )
 
-    def transform_images(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["img"]]
-        return {"input": images}
+    if args.dataset_name is not None:
+        def transform_images(examples):
+            images = [augmentations(image.convert("RGB")) for image in examples["image"]]
+            return {"input": images}
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            split="train",
+        )
+        dataset.set_transform(transform_images)
+    else:
+        # dataset = load_dataset(
+        #     "imagefolder",
+        #     data_dir=args.train_data_dir,
+        #     cache_dir=args.cache_dir,
+        #     split="train",
+        #     num_proc=16
+        # )
+        filelist_path = Path(args.train_data_dir) / "filename.txt"
+        dataset = ImageFolderDataset(
+            rootdir=args.train_data_dir,
+            filelist=filelist_path,
+            transform=augmentations
+        )
+
+    if args.dry_run:
+        dataset = Subset(dataset, list(range(0,128)))
 
     logger.info(f"Dataset size: {len(dataset)}")
-
-    dataset.set_transform(transform_images)
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.train_batch_size,
@@ -616,6 +316,7 @@ def main(args):
         num_training_steps=(len(train_dataloader) * args.num_epochs),
     )
 
+    print("Preparing accelerate...")
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
@@ -642,6 +343,7 @@ def main(args):
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
+    logger.info(f"  Num truncated = {args.num_truncated}")
     logger.info(f"  Num Epochs = {args.num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(
@@ -709,7 +411,7 @@ def main(args):
             # Sample a random timestep for each image
             timesteps = torch.randint(
                 0,
-                noise_scheduler.config.num_train_timesteps,
+                noise_scheduler.config.num_train_timesteps if args.num_truncated < 0 else args.num_truncated,
                 (bsz,),
                 device=clean_images.device,
             ).long()
@@ -817,34 +519,48 @@ def main(args):
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
+                if gan is None:
+                    with dnnlib.util.open_url(gan_ckpt_path.as_posix()) as f:
+                        gan = legacy.load_network_pkl(f)['G_ema'].eval() # type: ignore
+                    gan.dtype = torch.float16
+                    gan.to(accelerator.device)
 
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                pipeline = TPDMPipeline(unet=unet, scheduler=noise_scheduler, gan_generator=gan)
+
+                generator = torch.Generator(device=accelerator.device).manual_seed(0)
+                output_type="torch"
                 # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
+                images_processed = pipeline(
                     generator=generator,
                     batch_size=args.eval_batch_size,
-                    num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="numpy",
+                    truncated_step=args.num_truncated,
+                    output_type=output_type,
+                    device=accelerator.device
                 ).images
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
                 # denormalize the images and save to tensorboard
-                images_processed = (images * 255).round().astype("uint8")
+                if output_type != "torch":
+                    images_processed = (images_processed * 255).round().astype("uint8")
 
                 if args.logger == "tensorboard":
-                    if is_accelerate_version(">=", "0.17.0.dev0"):
-                        tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-                    else:
-                        tracker = accelerator.get_tracker("tensorboard")
-                    tracker.add_images(
-                        "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
-                    )
+                    # if is_accelerate_version(">=", "0.17.0.dev0"):
+                    #     tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+                    # else:
+                    #     tracker = accelerator.get_tracker("tensorboard")
+                    # tracker.add_images(
+                    #     "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
+                    # )
+                    try:
+                        tvu.save_image(
+                            images_processed, (image_dir/f"{str(epoch).zfill(5)}.png").as_posix()
+                        )
+                    except:
+                        import pdb
+                        pdb.set_trace()
+
                 elif args.logger == "wandb":
                     # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
                     accelerator.get_tracker("wandb").log(
@@ -883,4 +599,4 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    # main(args)
+    main(args)
