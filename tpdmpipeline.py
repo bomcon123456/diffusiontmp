@@ -72,7 +72,7 @@ class TPDMPipeline(DiffusionPipeline):
         image = randn_tensor(image_shape, generator=generator, device=device)
             
         # set step values
-        self.scheduler.set_timesteps(timesteps=list(range(truncated_step+1)[::-1]))
+        self.scheduler.set_timesteps(timesteps=list(range(truncated_step)[::-1]))
 
         label = torch.zeros([1, self.gan_generator.c_dim], device=device) 
         # 1. predict noise to T_Trunc with GAN
