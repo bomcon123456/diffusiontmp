@@ -38,6 +38,7 @@ class TPDMPipeline(DiffusionPipeline):
         return_dict: bool = True,
         show_progress: bool = True,
         device=None,
+        image=None,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
         The call function to the pipeline for generation.
@@ -63,20 +64,22 @@ class TPDMPipeline(DiffusionPipeline):
         if device is None:
             device = self.get_device()
 
-        # Sample gaussian noise to begin loop
-        image_shape = (
-            batch_size,
-            512,
-        )
-
-        image = randn_tensor(image_shape, generator=generator, device=device)
-            
         # set step values
         self.scheduler.set_timesteps(timesteps=list(range(truncated_step)[::-1]))
 
-        label = torch.zeros([1, self.gan_generator.c_dim], device=device) 
-        # 1. predict noise to T_Trunc with GAN
-        image = self.gan_generator(image, label)
+        if image is None:
+            # Sample gaussian noise to begin loop
+            image_shape = (
+                batch_size,
+                512,
+            )
+
+            image = randn_tensor(image_shape, generator=generator, device=device)
+
+            label = torch.zeros([batch_size, self.gan_generator.c_dim], device=device) 
+            # 1. predict noise to T_Trunc with GAN
+            image = self.gan_generator(image, label)
+
         pbar = self.progress_bar(self.scheduler.timesteps) if show_progress else self.scheduler.timesteps
         for t in pbar:
             # 2. predict noise model_output
